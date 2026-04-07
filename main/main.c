@@ -2,6 +2,7 @@
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "driver/twai.h"
 #include "driver/uart.h"
 #include "esp_event.h"
@@ -36,7 +37,7 @@ static bool is_bus_started = false;
 
 // --- HTML FÜR DIE WEB-KONFIGURATION ---
 const char* html_page =
-    "<!DOCTYPE html><html><head><style>"
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>"
     "body{font-family:Arial,sans-serif;background-color:#f4f4f9;color:#333;display:flex;justify-content:center;margin-"
     "top:50px;}"
     "div.box{background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);width:300px;}"
@@ -64,11 +65,46 @@ esp_err_t get_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
-// --- HTTP GET HANDLER (Zeigt das UART Log roh an) ---
-esp_err_t log_handler(httpd_req_t* req) {
-    httpd_resp_set_type(req, "text/plain");
-    char buf[512];
+// --- HTTP GET HANDLER (Zeigt das UART Log formatiert im Browser an) ---
+// --- HTTP GET HANDLER (Zeigt das UART Log formatiert im Browser an) ---
+esp_err_t log_handler(httpd_req_t *req) {
+    // Setzen der UTF-8 Kodierung und HTML als Typ
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    
+    // HTML-Kopf inklusive JavaScript für die ANSI-zu-HTML Farbkonvertierung
+    const char* html_head = 
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>UART Log</title>"
+        "<style>"
+        "body{background:#1e1e1e;color:#d4d4d4;padding:20px;font-family:monospace;}"
+        ".btn{background:#dc3545;color:#fff;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-family:Arial;font-size:14px;margin-bottom:15px;}"
+        ".btn:hover{background:#c82333;}"
+        "</style>"
+        "<script>"
+        "window.onload = function() {"
+        "  var p = document.getElementById('log-output');"
+        // Sucht nach ANSI-Codes (Escape-Zeichen \x1B) und wandelt sie in spans um
+        "  p.innerHTML = p.innerHTML.replace(/\\x1B\\[([0-9;]*)m/g, function(m, p1) {"
+        "    if (p1 === '0' || p1 === '') return '</span>';" // Reset = Span schließen
+        "    let s = '';"
+        "    if (p1.includes('31')) s = 'color:#ff5555;'; "       // Error (Rot)
+        "    else if (p1.includes('32')) s = 'color:#50fa7b;'; "  // Info (Grün)
+        "    else if (p1.includes('33')) s = 'color:#f1fa8c;'; "  // Warn (Gelb)
+        "    else if (p1.includes('34')) s = 'color:#bd93f9;'; "  // Blau
+        "    else if (p1.includes('36')) s = 'color:#8be9fd;'; "  // Cyan
+        "    if (p1.includes('1;')) s += 'font-weight:bold;';"    // Fettgedruckt
+        "    return s ? '<span style=\"' + s + '\">' : '';"
+        "  });"
+        "};"
+        "</script>"
+        "</head><body>"
+        "<form action=\"/clear_log\" method=\"POST\">"
+        "<input type=\"submit\" class=\"btn\" value=\"Log löschen\">"
+        "</form><pre id=\"log-output\">";
+        
+    httpd_resp_send_chunk(req, html_head, strlen(html_head));
 
+    char buf[512];
+    
     // Zuerst das alte Log senden (falls vorhanden)
     FILE* f_old = fopen("/spiffs/log_old.txt", "r");
     if (f_old) {
@@ -87,12 +123,28 @@ esp_err_t log_handler(httpd_req_t* req) {
             httpd_resp_send_chunk(req, buf, read_bytes);
         }
         fclose(f);
-    } else if (!f_old) {
-        httpd_resp_send_chunk(req, "Noch kein Log vorhanden.", 24);
     }
+
+    // HTML-Fuß senden
+    const char* html_foot = "</pre></body></html>";
+    httpd_resp_send_chunk(req, html_foot, strlen(html_foot));
 
     // Chunked Transfer beenden
     httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// --- HTTP POST HANDLER (Löscht die Log-Dateien) ---
+esp_err_t clear_log_handler(httpd_req_t* req) {
+    unlink("/spiffs/log.txt");
+    unlink("/spiffs/log_old.txt");
+
+    ESP_LOGI(TAG, "Log-Dateien wurden gelöscht.");
+
+    // Redirect zurück zur Log-Seite (die nun leer sein wird)
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/log");
+    httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -171,10 +223,13 @@ httpd_handle_t start_webserver(void) {
         httpd_uri_t uri_get = {.uri = "/", .method = HTTP_GET, .handler = get_handler, .user_ctx = NULL};
         httpd_uri_t uri_post = {.uri = "/save", .method = HTTP_POST, .handler = post_handler, .user_ctx = NULL};
         httpd_uri_t uri_log = {.uri = "/log", .method = HTTP_GET, .handler = log_handler, .user_ctx = NULL};
+        httpd_uri_t uri_clear = {
+            .uri = "/clear_log", .method = HTTP_POST, .handler = clear_log_handler, .user_ctx = NULL};
 
         httpd_register_uri_handler(server, &uri_get);
         httpd_register_uri_handler(server, &uri_post);
         httpd_register_uri_handler(server, &uri_log);
+        httpd_register_uri_handler(server, &uri_clear);
     }
     return server;
 }
