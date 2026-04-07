@@ -94,5 +94,19 @@ if __name__ == "__main__":
 
 ---
 
+## CAN-Monitor
+
+Der CAN-Adapter kann mit jeder slcan-fähiger Software verwendet werden. Als Demonstration ist ein kleines CAN-Analysetool enthalten mit folgenden Features:
+
+- Single Python File
+- Konfigurierbare Parser für Pakete (ähnlich dbc-files, nur flexibler und einfacher einzustellen), um Strukturen in CAN-Messages zu dekodieren
+    * Die Parser können auch Informationen aus der Message-ID extrahieren (wenn z.B. eine Node-Adresse in der Message ID codiert wird)
+    * Multiplexing über ein Datenbyte in der CAN-Message
+- Log View (Liste der empfangenen Pakete + Interpretation durch die Parser)
+- Live View (eine Art Dashboard-Ansicht der geparsten Messages)
+- Messages senden
+- Sende-Tasks: Konfigurierbare Tasks um vorkonfigurierte Messages in einem festen Zeitraster zu senden
+- Empfangszähler
+
 ## Lizenz
-Dieses Projekt ist für Ausbildungszwecke und Prototyping gedacht. Die Verwendung erfolgt auf eigene Gefahr (insbesondere im Kontext von KFZ-Systemen).
+Apache 2.0
