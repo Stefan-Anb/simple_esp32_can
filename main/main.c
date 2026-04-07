@@ -1,8 +1,13 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/param.h>
+#include <sys/stat.h>
 #include "driver/twai.h"
+#include "driver/uart.h"
 #include "esp_event.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_spiffs.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -10,35 +15,84 @@
 #include "freertos/task.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
-#include "nvs_flash.h"
-#include "wificonf.h"
-#include "esp_http_server.h"
 #include "nvs.h"
-#include <sys/param.h>
+#include "nvs_flash.h"
 
 // --- KONFIGURATION ---
-#define ENABLE_GPIO 35
-#define TCP_PORT  8080
-#define CAN_TX_IO 37
-#define CAN_RX_IO 36
+#define ENABLE_GPIO     35
+#define TCP_PORT        8080
+#define CAN_TX_IO       37
+#define CAN_RX_IO       36
+
+// --- UART LOG KONFIGURATION ---
+#define UART_LOG_RX_PIN 42
+#define UART_LOG_PORT   UART_NUM_1
+#define UART_LOG_BAUD   115200
+#define LOG_MAX_SIZE    (200 * 1024) // 200 KB pro Datei (max 400 KB gesamt durch Rotation)
 
 static const char* TAG = "SLCAN_ESP32";
 static bool is_driver_installed = false;
 static bool is_bus_started = false;
 
 // --- HTML FÜR DIE WEB-KONFIGURATION ---
-const char* html_page = 
-    "<!DOCTYPE html><html><body>"
-    "<h2>WLAN Konfiguration</h2>"
+const char* html_page =
+    "<!DOCTYPE html><html><head><style>"
+    "body{font-family:Arial,sans-serif;background-color:#f4f4f9;color:#333;display:flex;justify-content:center;margin-"
+    "top:50px;}"
+    "div.box{background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);width:300px;}"
+    "h2{margin-top:0;text-align:center;}"
+    "input[type='text']{width:100%;padding:10px;margin:10px 0 20px 0;border:1px solid "
+    "#ccc;border-radius:4px;box-sizing:border-box;}"
+    "input[type='submit']{background:#007BFF;color:#fff;border:none;padding:12px;width:100%;border-radius:4px;cursor:"
+    "pointer;font-size:16px;}"
+    "input[type='submit']:hover{background:#0056b3;}"
+    "a.log-btn{display:block;text-align:center;margin-top:15px;color:#007BFF;text-decoration:none;font-weight:bold;}"
+    "</style></head><body>"
+    "<div class='box'>"
+    "<h2>WLAN Setup</h2>"
     "<form action=\"/save\" method=\"POST\">"
-    "SSID: <input type=\"text\" name=\"ssid\"><br><br>"
-    "Pass: <input type=\"text\" name=\"pass\"><br><br>"
+    "<label>SSID:</label><input type=\"text\" name=\"ssid\">"
+    "<label>Passwort:</label><input type=\"text\" name=\"pass\">"
     "<input type=\"submit\" value=\"Speichern & Neustart\">"
-    "</form></body></html>";
+    "</form>"
+    "<a href=\"/log\" class=\"log-btn\" target=\"_blank\">UART Log ansehen</a>"
+    "</div></body></html>";
 
 // --- HTTP GET HANDLER (Zeigt die Seite an) ---
-esp_err_t get_handler(httpd_req_t *req) {
+esp_err_t get_handler(httpd_req_t* req) {
     httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// --- HTTP GET HANDLER (Zeigt das UART Log roh an) ---
+esp_err_t log_handler(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/plain");
+    char buf[512];
+
+    // Zuerst das alte Log senden (falls vorhanden)
+    FILE* f_old = fopen("/spiffs/log_old.txt", "r");
+    if (f_old) {
+        size_t read_bytes;
+        while ((read_bytes = fread(buf, 1, sizeof(buf), f_old)) > 0) {
+            httpd_resp_send_chunk(req, buf, read_bytes);
+        }
+        fclose(f_old);
+    }
+
+    // Dann das aktuelle Log senden
+    FILE* f = fopen("/spiffs/log.txt", "r");
+    if (f) {
+        size_t read_bytes;
+        while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
+            httpd_resp_send_chunk(req, buf, read_bytes);
+        }
+        fclose(f);
+    } else if (!f_old) {
+        httpd_resp_send_chunk(req, "Noch kein Log vorhanden.", 24);
+    }
+
+    // Chunked Transfer beenden
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -55,8 +109,8 @@ static int hex_to_int(char c) {
     return 0;
 }
 
-void url_decode(char *str) {
-    char *data = str;
+void url_decode(char* str) {
+    char* data = str;
     while (*data) {
         if (*data == '+') {
             *str = ' ';
@@ -73,27 +127,26 @@ void url_decode(char *str) {
 }
 
 // --- HTTP POST HANDLER (Speichert die Daten und startet neu) ---
-esp_err_t post_handler(httpd_req_t *req) {
+esp_err_t post_handler(httpd_req_t* req) {
     char buf[100];
     int ret, remaining = req->content_len;
-    
-    // Daten aus dem POST-Request lesen (Format: ssid=MEINE_SSID&pass=MEIN_PASS)
-    if ((ret = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)))) <= 0) return ESP_FAIL;
+
+    if ((ret = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)))) <= 0) {
+        return ESP_FAIL;
+    }
     buf[ret] = '\0';
 
     char ssid[32] = {0};
     char pass[64] = {0};
-    
-    // Simples Parsen der URL-encoded Parameter
-    if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) == ESP_OK &&
-        httpd_query_key_value(buf, "pass", pass, sizeof(pass)) == ESP_OK) {
+
+    if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) == ESP_OK
+        && httpd_query_key_value(buf, "pass", pass, sizeof(pass)) == ESP_OK) {
 
         url_decode(ssid);
         url_decode(pass);
-        
+
         ESP_LOGI(TAG, "Neue SSID empfangen: %s", ssid);
-        
-        // In den NVS Flash speichern
+
         nvs_handle_t nvs;
         nvs_open("wifi_cfg", NVS_READWRITE, &nvs);
         nvs_set_str(nvs, "ssid", ssid);
@@ -103,7 +156,7 @@ esp_err_t post_handler(httpd_req_t *req) {
 
         httpd_resp_send(req, "Gespeichert! ESP32 startet neu...", HTTPD_RESP_USE_STRLEN);
         vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_restart(); // Neustart, um neue Daten anzuwenden
+        esp_restart();
     } else {
         httpd_resp_send_500(req);
     }
@@ -115,10 +168,13 @@ httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t uri_get = { .uri = "/", .method = HTTP_GET, .handler = get_handler, .user_ctx = NULL };
-        httpd_uri_t uri_post = { .uri = "/save", .method = HTTP_POST, .handler = post_handler, .user_ctx = NULL };
+        httpd_uri_t uri_get = {.uri = "/", .method = HTTP_GET, .handler = get_handler, .user_ctx = NULL};
+        httpd_uri_t uri_post = {.uri = "/save", .method = HTTP_POST, .handler = post_handler, .user_ctx = NULL};
+        httpd_uri_t uri_log = {.uri = "/log", .method = HTTP_GET, .handler = log_handler, .user_ctx = NULL};
+
         httpd_register_uri_handler(server, &uri_get);
         httpd_register_uri_handler(server, &uri_post);
+        httpd_register_uri_handler(server, &uri_log);
     }
     return server;
 }
@@ -139,8 +195,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 void wifi_init_ap_sta(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    // Beide Netzwerk-Interfaces erstellen
+
     esp_netif_create_default_wifi_ap();
     esp_netif_create_default_wifi_sta();
 
@@ -150,19 +205,15 @@ void wifi_init_ap_sta(void) {
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
 
-    // AP Konfiguration (Das Netzwerk, mit dem du dich zur Konfiguration verbindest)
     wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "ESP32-Config",
-            .ssid_len = strlen("ESP32-Config"),
-            .channel = 1,
-            .password = "", // Offenes Netzwerk
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        },
+        .ap = {.ssid = "ESP32-Config",
+               .ssid_len = strlen("ESP32-Config"),
+               .channel = 1,
+               .password = "",
+               .max_connection = 4,
+               .authmode = WIFI_AUTH_OPEN},
     };
 
-    // Gespeicherte STA-Daten aus NVS lesen
     wifi_config_t sta_config = {0};
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi_cfg", NVS_READONLY, &nvs);
@@ -177,22 +228,17 @@ void wifi_init_ap_sta(void) {
         ESP_LOGW(TAG, "Keine WLAN-Daten gespeichert. Starte nur im AP-Modus.");
     }
 
-    // Modus setzen: AP + Station parallel
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     if (strlen((char*)sta_config.sta.ssid) > 0) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     }
-    
+
     ESP_ERROR_CHECK(esp_wifi_start());
-    
-    // Webserver für die Konfiguration starten
     start_webserver();
 }
 
 // --- SLCAN LOGIK ---
-
-
 esp_err_t setup_twai(int speed_idx) {
     if (is_driver_installed) {
         twai_driver_uninstall();
@@ -200,6 +246,8 @@ esp_err_t setup_twai(int speed_idx) {
     }
     ESP_LOGI(TAG, "Setup port with speed index %d", speed_idx);
     twai_general_config_t g_cfg = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_IO, CAN_RX_IO, TWAI_MODE_NORMAL);
+    g_cfg.rx_queue_len = 200;
+    g_cfg.tx_queue_len = 20;
     twai_filter_config_t f_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     twai_timing_config_t t_cfg;
 
@@ -246,10 +294,8 @@ void slcan_task(void* pv) {
 
     char rx_buf[128];
     while (1) {
-        ESP_LOGI(TAG, "Warte auf neuen Client...");
-        int sock = accept(listen_sock, NULL, NULL); // Hier blockiert der Task, bis jemand kommt
+        int sock = accept(listen_sock, NULL, NULL);
         if (sock < 0) {
-            ESP_LOGE(TAG, "Accept fehlgeschlagen: errno %d", errno);
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -259,7 +305,7 @@ void slcan_task(void* pv) {
         int rx_idx = 0;
         while (1) {
             char c;
-            if (recv(sock, &c, 1, 0) > 128) { // Error oder Disconnect
+            if (recv(sock, &c, 1, 0) > 128) {
                 if (errno != EAGAIN) {
                     break;
                 }
@@ -324,8 +370,42 @@ void slcan_task(void* pv) {
     }
 }
 
+// --- UART LOGGER TASK ---
+void uart_logger_task(void* pvParameters) {
+    uart_config_t uart_config = {.baud_rate = UART_LOG_BAUD,
+                                 .data_bits = UART_DATA_8_BITS,
+                                 .parity = UART_PARITY_DISABLE,
+                                 .stop_bits = UART_STOP_BITS_1,
+                                 .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
+    uart_param_config(UART_LOG_PORT, &uart_config);
+    uart_set_pin(UART_LOG_PORT, UART_PIN_NO_CHANGE, UART_LOG_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_LOG_PORT, 2048, 0, 0, NULL, 0);
+
+    uint8_t data[256];
+
+    while (1) {
+        int length = uart_read_bytes(UART_LOG_PORT, data, sizeof(data) - 1, 100 / portTICK_PERIOD_MS);
+        if (length > 0) {
+            FILE* f = fopen("/spiffs/log.txt", "a");
+            if (f) {
+                fwrite(data, 1, length, f);
+                fclose(f);
+            }
+
+            // Datei-Rotation bei Überschreiten der Maximalgröße
+            struct stat st;
+            if (stat("/spiffs/log.txt", &st) == 0 && st.st_size > LOG_MAX_SIZE) {
+                ESP_LOGI(TAG, "Log rotiert.");
+                unlink("/spiffs/log_old.txt");                    // Altes Log löschen
+                rename("/spiffs/log.txt", "/spiffs/log_old.txt"); // Aktuelles Log wird zum alten Log
+            }
+        }
+    }
+}
+
 // --- MAIN ---
 void app_main(void) {
+    // GPIO Init
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << ENABLE_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -335,8 +415,8 @@ void app_main(void) {
     };
     gpio_config(&io_conf);
     gpio_set_level(ENABLE_GPIO, 1);
-    ESP_LOGI(TAG, "GPIO %d auf HIGH gesetzt.", ENABLE_GPIO);
 
+    // NVS Init
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -344,6 +424,18 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // SPIFFS Init
+    esp_vfs_spiffs_conf_t spiffs_conf = {
+        .base_path = "/spiffs", .partition_label = NULL, .max_files = 3, .format_if_mount_failed = true};
+    ret = esp_vfs_spiffs_register(&spiffs_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Fehler beim Initialisieren von SPIFFS (%s)", esp_err_to_name(ret));
+    }
+
+    // WiFi & Webserver
     wifi_init_ap_sta();
+
+    // Tasks starten
     xTaskCreate(slcan_task, "slcan", 4096, NULL, 5, NULL);
+    xTaskCreate(uart_logger_task, "uart_log", 4096, NULL, 4, NULL);
 }
