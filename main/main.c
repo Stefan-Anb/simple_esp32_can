@@ -26,7 +26,7 @@
 #define CAN_RX_IO       36
 
 // --- UART LOG KONFIGURATION ---
-#define UART_LOG_RX_PIN 42
+#define UART_LOG_RX_PIN 7
 #define UART_LOG_PORT   UART_NUM_1
 #define UART_LOG_BAUD   115200
 #define LOG_MAX_SIZE    (200 * 1024) // 200 KB pro Datei (max 400 KB gesamt durch Rotation)
@@ -34,34 +34,39 @@
 static const char* TAG = "SLCAN_ESP32";
 static bool is_driver_installed = false;
 static bool is_bus_started = false;
+static char station_ip[16] = "n/a";
+static char ap_ssid_current[33] = "ESP32-Config";
+static char sta_ssid_current[33] = "";
 
 // --- HTML FÜR DIE WEB-KONFIGURATION ---
-const char* html_page =
-    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>"
-    "body{font-family:Arial,sans-serif;background-color:#f4f4f9;color:#333;display:flex;justify-content:center;margin-"
-    "top:50px;}"
-    "div.box{background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);width:300px;}"
-    "h2{margin-top:0;text-align:center;}"
-    "input[type='text']{width:100%;padding:10px;margin:10px 0 20px 0;border:1px solid "
-    "#ccc;border-radius:4px;box-sizing:border-box;}"
-    "input[type='submit']{background:#007BFF;color:#fff;border:none;padding:12px;width:100%;border-radius:4px;cursor:"
-    "pointer;font-size:16px;}"
-    "input[type='submit']:hover{background:#0056b3;}"
-    "a.log-btn{display:block;text-align:center;margin-top:15px;color:#007BFF;text-decoration:none;font-weight:bold;}"
-    "</style></head><body>"
-    "<div class='box'>"
-    "<h2>WLAN Setup</h2>"
-    "<form action=\"/save\" method=\"POST\">"
-    "<label>SSID:</label><input type=\"text\" name=\"ssid\">"
-    "<label>Passwort:</label><input type=\"text\" name=\"pass\">"
-    "<input type=\"submit\" value=\"Speichern & Neustart\">"
-    "</form>"
-    "<a href=\"/log\" class=\"log-btn\" target=\"_blank\">UART Log ansehen</a>"
-    "</div></body></html>";
+// Keep template CSS and structure in code but build page dynamically in the GET handler
 
 // --- HTTP GET HANDLER (Zeigt die Seite an) ---
 esp_err_t get_handler(httpd_req_t* req) {
-    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    const char* head = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>"
+        "body{font-family:Arial,sans-serif;background-color:#f4f4f9;color:#333;display:flex;justify-content:center;margin-top:50px;}"
+        "div.box{background:#fff;padding:30px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);width:340px;}"
+        "h2{margin-top:0;text-align:center;}input[type='text']{width:100%;padding:10px;margin:10px 0 20px 0;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;}"
+        "input[type='submit']{background:#007BFF;color:#fff;border:none;padding:12px;width:100%;border-radius:4px;cursor:pointer;font-size:16px;}"
+        "input[type='submit']:hover{background:#0056b3;}a.log-btn{display:block;text-align:center;margin-top:15px;color:#007BFF;text-decoration:none;font-weight:bold;}"
+        "</style></head><body><div class='box'><h2>WLAN Setup</h2>";
+
+    const char* mid1 = "<p><strong>Station IP:</strong> ";
+    const char* mid2 = "</p><form action=\"/save\" method=\"POST\">"
+                       "<label>Access Point SSID:</label><input type=\"text\" name=\"ap_ssid\" value=\"";
+    const char* mid3 = "\">"
+                       "<label>External Wifi SSID:</label><input type=\"text\" name=\"ssid\">"
+                       "<label>Passwort:</label><input type=\"text\" name=\"pass\">"
+                       "<input type=\"submit\" value=\"Speichern & Neustart\">"
+                       "</form><a href=\"/log\" class=\"log-btn\" target=\"_blank\">UART Log ansehen</a></div></body></html>";
+
+    httpd_resp_send_chunk(req, head, strlen(head));
+    httpd_resp_send_chunk(req, mid1, strlen(mid1));
+    httpd_resp_send_chunk(req, station_ip, strlen(station_ip));
+    httpd_resp_send_chunk(req, mid2, strlen(mid2));
+    httpd_resp_send_chunk(req, ap_ssid_current, strlen(ap_ssid_current));
+    httpd_resp_send_chunk(req, mid3, strlen(mid3));
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -191,27 +196,38 @@ esp_err_t post_handler(httpd_req_t* req) {
     char ssid[32] = {0};
     char pass[64] = {0};
 
-    if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) == ESP_OK
-        && httpd_query_key_value(buf, "pass", pass, sizeof(pass)) == ESP_OK) {
+    // Read fields if present (password may be empty)
+    char ap_ssid[33] = {0};
+    httpd_query_key_value(buf, "ap_ssid", ap_ssid, sizeof(ap_ssid));
+    httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid));
+    httpd_query_key_value(buf, "pass", pass, sizeof(pass));
 
-        url_decode(ssid);
-        url_decode(pass);
+    url_decode(ap_ssid);
+    url_decode(ssid);
+    url_decode(pass);
 
-        ESP_LOGI(TAG, "Neue SSID empfangen: %s", ssid);
+    ESP_LOGI(TAG, "POST received: ap_ssid='%s', ssid='%s', pass_len=%d", ap_ssid, ssid, (int)strlen(pass));
 
-        nvs_handle_t nvs;
-        nvs_open("wifi_cfg", NVS_READWRITE, &nvs);
-        nvs_set_str(nvs, "ssid", ssid);
-        nvs_set_str(nvs, "pass", pass);
+    nvs_handle_t nvs;
+    if (nvs_open("wifi_cfg", NVS_READWRITE, &nvs) == ESP_OK) {
+        // Only update STA SSID/pass if a non-empty password was provided
+        if (strlen(pass) > 0 && strlen(ssid) > 0) {
+            nvs_set_str(nvs, "ssid", ssid);
+            nvs_set_str(nvs, "pass", pass);
+        } else {
+            ESP_LOGI(TAG, "Empty password -> STA SSID/pass not updated");
+        }
+
+        if (strlen(ap_ssid) > 0) {
+            nvs_set_str(nvs, "ap_ssid", ap_ssid);
+        }
         nvs_commit(nvs);
         nvs_close(nvs);
-
-        httpd_resp_send(req, "Gespeichert! ESP32 startet neu...", HTTPD_RESP_USE_STRLEN);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_restart();
-    } else {
-        httpd_resp_send_500(req);
     }
+
+    httpd_resp_send(req, "Gespeichert! ESP32 startet neu...", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
     return ESP_OK;
 }
 
@@ -244,6 +260,8 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
         ESP_LOGI(TAG, "Verbunden! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        // Store human-readable IP for web UI
+        snprintf(station_ip, sizeof(station_ip), IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
 
@@ -260,28 +278,36 @@ void wifi_init_ap_sta(void) {
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
 
-    wifi_config_t ap_config = {
-        .ap = {.ssid = "ESP32-Config",
-               .ssid_len = strlen("ESP32-Config"),
-               .channel = 1,
-               .password = "",
-               .max_connection = 4,
-               .authmode = WIFI_AUTH_OPEN},
-    };
-
+    // Read stored AP SSID and STA credentials from NVS (if present)
+    wifi_config_t ap_config = {0};
     wifi_config_t sta_config = {0};
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("wifi_cfg", NVS_READONLY, &nvs);
     if (err == ESP_OK) {
-        size_t len = sizeof(sta_config.sta.ssid);
-        nvs_get_str(nvs, "ssid", (char*)sta_config.sta.ssid, &len);
+        size_t len = sizeof(ap_ssid_current);
+        if (nvs_get_str(nvs, "ap_ssid", ap_ssid_current, &len) == ESP_OK) {
+            ESP_LOGI(TAG, "Gespeicherte AP SSID: %s", ap_ssid_current);
+        }
+
+        len = sizeof(sta_config.sta.ssid);
+        if (nvs_get_str(nvs, "ssid", (char*)sta_config.sta.ssid, &len) == ESP_OK) {
+            strncpy(sta_ssid_current, (char*)sta_config.sta.ssid, sizeof(sta_ssid_current) - 1);
+        }
         len = sizeof(sta_config.sta.password);
         nvs_get_str(nvs, "pass", (char*)sta_config.sta.password, &len);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Gespeicherte SSID gefunden: %s", sta_config.sta.ssid);
+        ESP_LOGI(TAG, "Gespeicherte STA SSID gefunden: %s", sta_config.sta.ssid);
     } else {
         ESP_LOGW(TAG, "Keine WLAN-Daten gespeichert. Starte nur im AP-Modus.");
     }
+
+    // Apply AP config using the potentially-updated ap_ssid_current
+    strncpy((char*)ap_config.ap.ssid, ap_ssid_current, sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid_len = strlen(ap_ssid_current);
+    ap_config.ap.channel = 1;
+    ap_config.ap.password[0] = '\0';
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));

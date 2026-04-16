@@ -1,0 +1,27 @@
+{
+  "fw_filename": "simple_esp32_can.bin",
+  "ble_prefix": "terry",
+  "type": "USB",
+  "files": [
+    {
+      "name": "simple_esp32_can.bin",
+      "address": "0x10000",
+      "type": "USB"
+    },
+    {
+      "name": "bootloader.bin",
+      "address": "0x0",
+      "type": "USB"
+    },
+    {
+      "name": "partition-table.bin",
+      "address": "0x8000",
+      "type": "USB"
+    },
+    {
+      "name": "ota_data_initial.bin",
+      "address": "0xd000",
+      "type": "USB"
+    }
+  ]
+}

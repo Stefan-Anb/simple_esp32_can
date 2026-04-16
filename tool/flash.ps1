@@ -65,7 +65,7 @@ Invoke-Checked -Description "dependency installation" -Command { & $pythonExe -m
 
 cd package
 
-python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset --port $Port write_flash --flash_mode dio --flash_size 4MB --flash_freq 80m 0x0 bootloader.bin 0x10000 simple_esp32_can.bin 0x8000 partition-table.bin 0xd000 ota_data_initial.bin
+$pythonExe -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset --port $Port write_flash --flash_mode dio --flash_size 4MB --flash_freq 80m 0x0 bootloader.bin 0x10000 simple_esp32_can.bin 0x8000 partition-table.bin 0xd000 ota_data_initial.bin
 
 Write-Host "`nSetup complete!"
 
